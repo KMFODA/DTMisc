@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from DTMisc.convergence.hellaswag import render_example, iterate_examples
+from hellaswag import render_example, iterate_examples
 from torch_optimizer import Lamb
 import wandb
 from transformers import AutoModelForCausalLM, AutoConfig
@@ -16,7 +16,7 @@ HF=True
 wandb.init(
     project="lamb",
     entity="kmfoda",
-    name="openai-community/gpt2--sq1024-bs32k-dtedu_fineweb10B"
+    name="distributed/gpt2-250m-convergence-test-sq1024-bs32k-dtedu_fineweb10B"
 )
 class CausalSelfAttention(nn.Module):
 
@@ -377,7 +377,7 @@ torch.set_float32_matmul_precision('high')
 
 # create model
 if HF:
-    model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained("openai-community/gpt2")) # or init from OpenAI GPT-2
+    model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained("distributed/gpt2-250m-convergence-test")) # or init from OpenAI GPT-2
 else:
     model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)

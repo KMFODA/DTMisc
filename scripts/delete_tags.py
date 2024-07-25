@@ -1,6 +1,6 @@
 from huggingface_hub import list_repo_refs, delete_tag
 
-repo_id = "kmfoda/gpt2-1b"
+repo_id = "distributed/gpt2-250m"
 
 refs = list_repo_refs(repo_id, repo_type="model")
 tags = refs.tags if refs.tags else None
