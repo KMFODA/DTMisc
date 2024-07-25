@@ -6,9 +6,18 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from hellaswag import render_example, iterate_examples
+from DTMisc.convergence.hellaswag import render_example, iterate_examples
+from torch_optimizer import Lamb
+import wandb
+from transformers import AutoModelForCausalLM, AutoConfig
 # -----------------------------------------------------------------------------
 
+HF=True
+wandb.init(
+    project="lamb",
+    entity="kmfoda",
+    name="openai-community/gpt2--sq1024-bs32k-dtedu_fineweb10B"
+)
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -194,12 +203,43 @@ class GPT(nn.Module):
             print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
             print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = 'fused' in inspect.signature(Lamb).parameters
         use_fused = fused_available and device_type == "cuda"
         if master_process:
-            print(f"using fused AdamW: {use_fused}")
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+            # print(f"using fused AdamW: {use_fused}")
+            print(f"using fused Lamb: {use_fused}")
+        # optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        optimizer = Lamb(optim_groups, lr=learning_rate)
         return optimizer
+
+def configure_optimizers(model, weight_decay, learning_rate, device_type):
+    # start with all of the candidate parameters (that require grad)
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
+    num_decay_params = sum(p.numel() for p in decay_params)
+    num_nodecay_params = sum(p.numel() for p in nodecay_params)
+    if master_process:
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+    # Create AdamW optimizer and use the fused version if it is available
+    # fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    fused_available = 'fused' in inspect.signature(Lamb).parameters
+    use_fused = fused_available and device_type == "cuda"
+    if master_process:
+        # print(f"using fused AdamW: {use_fused}")
+        print(f"using fused Lamb: {use_fused}")
+    # optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+    optimizer = Lamb(optim_groups, lr=learning_rate)
+    return optimizer
 
 # -----------------------------------------------------------------------------
 import tiktoken
@@ -322,7 +362,7 @@ if torch.cuda.is_available():
 enc = tiktoken.get_encoding("gpt2")
 
 total_batch_size = 32_768_000 #524288 # 2**19, ~0.5M, in number of tokens
-B = 64 # micro batch size
+B = 1 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -336,8 +376,10 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 torch.set_float32_matmul_precision('high')
 
 # create model
-model = GPT(GPTConfig(vocab_size=50304))
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
+if HF:
+    model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained("openai-community/gpt2")) # or init from OpenAI GPT-2
+else:
+    model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
@@ -364,7 +406,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=5e-3, device_type=device_type)
+optimizer = configure_optimizers(model, weight_decay=0.1, learning_rate=5e-3, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -388,13 +430,22 @@ for step in range(max_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+                    if HF:
+                        outputs = model(input_ids=x, labels=y)
+                        logits = outputs.logits
+                        loss = outputs.loss
+                    else:
+                        logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
+            wandb.log({
+                "step": step,
+                "validation": val_loss_accum.item(),
+            })
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
             if step > 0 and (step % 5000 == 0 or last_step):
@@ -425,7 +476,12 @@ for step in range(max_steps):
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
+                    if HF:
+                        outputs = model(input_ids=tokens, labels=tokens)
+                        logits = outputs.logits
+                        loss = outputs.loss
+                    else:
+                        logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -458,7 +514,12 @@ for step in range(max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    if HF:
+                        outputs = model(input_ids=xgen, labels=xgen)
+                        logits = outputs.logits
+                        loss = outputs.loss
+                    else:
+                        logits, loss = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :] # (B, vocab_size)
                 # get the probabilities
@@ -490,7 +551,12 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
+            if HF:
+                outputs = model(input_ids=x, labels=y)
+                logits = outputs.logits
+                loss = outputs.loss
+            else:
+                logits, loss = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
@@ -514,6 +580,14 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        wandb.log({
+            "step": step,
+            "train_loss": loss_accum.item(),
+            "learning_rate":lr,
+            "norm":norm,
+            "dt":dt*1000,
+            "tok/sec": tokens_per_sec,
+        })
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 
